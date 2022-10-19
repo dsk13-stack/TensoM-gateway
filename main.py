@@ -13,7 +13,7 @@ from serial.tools import list_ports
 import ui
 
 
-logging.basicConfig(filename="app.log", filemode="w", format="[%(asctime)s: %(levelname)s] %(message)s", level=logging.DEBUG)
+logging.basicConfig(filename="app_log.log", filemode="w", format="[%(asctime)s: %(levelname)s] %(message)s", level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
@@ -68,8 +68,8 @@ class TcpServer:
         return self.connection.recv(data_len)
 
     def disconnect(self):
-        self.connection.shutdown(1)
-        self.connection.close()
+        self.sock.close()
+
 
 
 class UiMainWindow(ui.MainWindow):
@@ -86,16 +86,10 @@ class UiMainWindow(ui.MainWindow):
         self.setupUi(self)
         self.connect_actions()
         self.widgets_modify()
-        self.connection = False
-        self.ndr = False
-        self.communication_settings = ["COM1",
-                                       "8",
-                                       "9600",
-                                       "1",
-                                       "Нет",
-                                       "1.0",
-                                       "127.0.0.1",
-                                       "2000"]
+        self.connection_enabled = False
+        self.new_data_received = False
+        self.communication_settings = ["COM1", "8", "9600", "1", "Нет", "1.0",
+                                       "127.0.0.1", "2000"]
         self.config_file_path = "unnamed.json"
         self.server = TcpServer(
             self.communication_settings[6], int(self.communication_settings[7]))
@@ -105,6 +99,7 @@ class UiMainWindow(ui.MainWindow):
         self.sock_thread = threading.Thread(
             target=self.sock_stream, args=(self.devices_table,), daemon=True)
         self.sock_thread.start()
+        self.thread_lock = threading.Lock()
 
     def connect_actions(self):
         self.act_open.triggered.connect(
@@ -135,7 +130,8 @@ class UiMainWindow(ui.MainWindow):
         self.act_save_as.setEnabled(False)
         self.btn_start_server.setEnabled(False)
         self.btn_stop_server.setEnabled(True)
-        self.connection = True
+        self.connection_enabled = True
+        self.statusBar().showMessage("Сервер запущен")
 
     def stop_connection(self):
         self.act_conn_settings.setEnabled(True)
@@ -147,12 +143,12 @@ class UiMainWindow(ui.MainWindow):
         self.act_save_as.setEnabled(True)
         self.btn_start_server.setEnabled(True)
         self.btn_stop_server.setEnabled(False)
-        self.connection = False
-        if self.server.connection is not None:
-            try:
-                self.server.disconnect()
-            except Exception:
-                logger.exception("Ошибка закрытия соединения")
+        self.connection_enabled = False
+        try:
+            self.server.disconnect()
+        except OSError:
+            logger.exception("Ошибка закрытия соединения")
+        self.statusBar().showMessage("Сервер остановлен")
 
     def widgets_modify(self):
         self.devices_table.horizontalHeader().setStretchLastSection(True)
@@ -181,41 +177,46 @@ class UiMainWindow(ui.MainWindow):
         Циклическое чтение данных из устройств
         по последовательному интерфейсу.
         Читает и записывает данные в таблицу,
-        устанавливает флаг self.ndr для TCP-сервера что данные обновлены.
+        устанавливает флаг self.new_data_received для TCP-сервера что данные обновлены.
         """
-        serial_connection = None
         addr_column = 1
         mass_type_column = 2
         data_colum = 3
         status_column = 4
+        com_port_open = False
+        serial_connection = None
         while True:
-            if self.connection:
-                port = self.communication_settings[0]
-                data_bits = int(self.communication_settings[1])
-                baud_rate = int(self.communication_settings[2])
-                parity = {
-                    "Нет": "N",
-                    "Even": "E",
-                    "Odd": "O",
-                    "Mark": "M",
-                    "Space": "S",
-                }
-                stop_bits = int(self.communication_settings[3])
-                timeout = float(self.communication_settings[5])
-                row_count = table.rowCount()
+            if self.connection_enabled:
                 try:
-                    for i in range(row_count):
+                    # Открытие COM-порта если он еще не был открыт
+                    if not com_port_open:
+                        port = self.communication_settings[0]
+                        data_bits = int(self.communication_settings[1])
+                        baud_rate = int(self.communication_settings[2])
+                        parity = {"Нет": "N",
+                                  "Even": "E",
+                                  "Odd": "O",
+                                  "Mark": "M",
+                                  "Space": "S"}
 
+                        stop_bits = int(self.communication_settings[3])
+                        timeout = float(self.communication_settings[5])
+                        serial_connection = serial.Serial(port, baud_rate, data_bits,
+                                                          parity[self.communication_settings[4]],
+                                                          stop_bits,
+                                                          timeout=timeout)
+                        com_port_open = True
+
+                    row_count = table.rowCount()
+                    for i in range(row_count):
                         message = []
                         addr = int(table.item(i, addr_column).text())
                         message.append(addr)
                         mass_type = table.item(i, mass_type_column).text()
                         message.append(0xc2) if mass_type == "Нетто" else message.append(0xc3)
-
                         crc = 0
                         for j in message:
                             crc = crc8(data=j, poly=0x69, crc=crc)
-
                         packet = bytearray()
                         packet.append(0xFF)
                         packet.append(message[0])
@@ -223,11 +224,6 @@ class UiMainWindow(ui.MainWindow):
                         packet.append(crc)
                         packet.append(0xFF)
                         packet.append(0xFF)
-
-                        serial_connection = serial.Serial(port, baud_rate, data_bits,
-                                                          parity[self.communication_settings[4]],
-                                                          stop_bits,
-                                                          timeout=timeout)
                         serial_connection.write(packet)
                         read_buffer = serial_connection.read_until(expected=b"\xff\xff")
 
@@ -251,35 +247,35 @@ class UiMainWindow(ui.MainWindow):
                         else:
                             self.change_cell(table, i, data_colum, str(get_weight(read_buffer)))
                             self.change_cell(table, i, status_column, "Ok")
-                        serial_connection.close()
-                    table.reset()
-                    self.ndr = True
-
+                        table.reset()
+                    self.thread_lock.acquire()
+                    self.new_data_received = True
+                    self.thread_lock.release()
                 except serial.serialutil.SerialException:
                     logger.exception("Ошибка COM-порта")
-                    self.error_dialog(
-                        "Ошибка COM-порта",
-                        "Последовательный порт " +
-                         self.communication_settings[0] +
-                        " недоступен или параметры неккоректны")
+                    self.error_dialog("Ошибка COM-порта",
+                                      "Последовательный порт " +
+                                      self.communication_settings[0] +
+                                      " недоступен или параметры неккоректны")
                     time.sleep(0.5)
                     self.stop_connection()
-                    if serial_connection is not None:
-                        serial_connection.close()
             else:
+                if com_port_open:
+                    serial_connection.close()
+                com_port_open = False
                 time.sleep(1)
 
     def sock_stream(self, table: QtWidgets.QTableWidget):
         """Сервер TCP
         Пассивный сервер. При завершении опроса устройств
         отправляет данные подключенному клиенту из таблицы.
-        Флаг self.ndr использован для отправки свежих данных
+        Флаг self.new_data_received использован для отправки свежих данных
         в случае задержки опроса устройств.
-        В случае любой ошибки перезапускает соединение
+        В случае ошибки перезапускает соединение
         """
         while True:
-            if self.connection:
-                if self.ndr:
+            if self.connection_enabled:
+                if self.new_data_received:
                     data = []
                     row_count = table.rowCount()
                     for i in range(row_count):
@@ -291,23 +287,19 @@ class UiMainWindow(ui.MainWindow):
                     except Exception:
                         logger.exception("Ошибка отправки данных")
                         try:
-                            logger.info("Создание подключения")
-                            peer = self.server.connect()
-                            self.statusBar().showMessage("Подключен клиент " + str(peer))
+                            self.statusBar().showMessage("Ожидание клиента")
+                            partner = self.server.connect()
+                            self.statusBar().showMessage("Подключен клиент " + str(partner))
                             self.server.send(sending_data)
                         except Exception:
-                            logger.exception("Ошибка повторного создания подключения")
-                            self.stop_connection()
-                            self.error_dialog(
-                                "Ошибка создания ТСР-подключения",
-                                "Запуск сервера невозможен. Проверьте праметры\n"
-                                "и перезапустите приложение")
-
-                    self.ndr = False
+                            logger.exception("Повторное создание подключения")
+                    self.thread_lock.acquire()
+                    self.new_data_received = False
+                    self.thread_lock.release()
             else:
                 time.sleep(1)
 
-    def device_num_control(self, table: QtWidgets.QTableWidget):
+    def row_quantity_control(self, table: QtWidgets.QTableWidget):
         if table.rowCount() <= 0:
             self.btn_start_server.setEnabled(False)
         else:
@@ -322,13 +314,13 @@ class UiMainWindow(ui.MainWindow):
             item.setText(data[j])
             item.setFlags(QtCore.Qt.ItemIsEnabled)
             table.setItem(row_count - 1, j, item)
-        self.device_num_control(table)
+        self.row_quantity_control(table)
 
     def remove_row(self, table: QtWidgets.QTableWidget):
         if table.rowCount() > 0:
             selected_row = table.currentRow()
             table.removeRow(selected_row)
-        self.device_num_control(table)
+        self.row_quantity_control(table)
 
     @staticmethod
     def change_cell(table: QtWidgets.QTableWidget, row: int = 0, column: int = 0, text: str = "",
@@ -374,7 +366,7 @@ class UiMainWindow(ui.MainWindow):
         self.save_config(config, self.config_file_path)
         self.statusBar().showMessage("Сохранено " + str(self.config_file_path))
 
-    def open_config(self, path: str) -> list:
+    def open_config_file(self, path: str) -> list:
         """Чтение конфигурации из файла
         В случае успешного открытия возвращает list
         в противном случае None
@@ -394,29 +386,38 @@ class UiMainWindow(ui.MainWindow):
         file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Открыть файл", "", "All Files (*);;json (*.json)", options=options)
         if file_path:
-            config = self.open_config(file_path)
+            config = self.open_config_file(file_path)
             if config is not None:
-                self.config_file_path = file_path
-                row_count = table.rowCount()
-                column_count = table.columnCount()
-                for i in range(len(self.communication_settings)):
-                    self.communication_settings[i] = config.pop(0)
-                for i in range(row_count, -1, -1):
-                    table.removeRow(i)
-                row_count = 0
-                table.insertRow(row_count)
-                j = 0
-                while config:
-                    if j > column_count - 1:
-                        j = 0
-                        row_count += 1
-                        table.insertRow(row_count)
-                    item = QtWidgets.QTableWidgetItem()
-                    item.setText(str(config.pop(0)))
-                    item.setFlags(QtCore.Qt.ItemIsEnabled)
-                    table.setItem(row_count, j, item)
-                    j += 1
-                self.statusBar().showMessage("Открыт файл " + str(self.config_file_path))
+                try:
+                    self.config_file_path = file_path
+                    row_count = table.rowCount()
+                    column_count = table.columnCount()
+                    for i in range(len(self.communication_settings)):
+                        self.communication_settings[i] = config.pop(0)
+                    for i in range(row_count, -1, -1):
+                        table.removeRow(i)
+                    row_count = 0
+                    table.insertRow(row_count)
+                    j = 0
+                    while config:
+                        if j > column_count - 1:
+                            j = 0
+                            row_count += 1
+                            table.insertRow(row_count)
+                        item = QtWidgets.QTableWidgetItem()
+                        item.setText(str(config.pop(0)))
+                        item.setFlags(QtCore.Qt.ItemIsEnabled)
+                        table.setItem(row_count, j, item)
+                        j += 1
+                    self.statusBar().showMessage("Открыт файл " + str(self.config_file_path))
+                    self.server_update()
+                except Exception:
+                    logger.exception("Ошибка открытия файла конфигурации")
+                    self.error_dialog("Ошибка открытия файла конфигурации",
+                                      "Невозможно загрузить конфигурацию из\n {path}".format(path=self.config_file_path))
+                    self.communication_settings = ["COM1", "8", "9600", "1", "Нет", "1.0",
+                                                   "127.0.0.1", "2000"]
+                    self.server_update()
 
     def save_as_file_dialog(self, table: QtWidgets.QTableWidget):
         config = []
@@ -581,7 +582,7 @@ class SettingsDialog(ui.SettingsDialog):
             str(self.cmx_baud_rate.currentText()),
             str(self.cmx_stop_bits.currentText()),
             str(self.cmx_parity.currentText()),
-            str(self.lne_timeout.text()),
+            str(self.lne_timeout.text()).replace(",", "."),
             str(self.lne_ip_addr.text()),
             str(self.lne_ip_port.text())]
         return settings if self.settings_accepted else None
@@ -596,7 +597,7 @@ class SettingsDialog(ui.SettingsDialog):
         self.cmx_baud_rate.setCurrentText(settings_list[2])
         self.cmx_stop_bits.setCurrentText(settings_list[3])
         self.cmx_parity.setCurrentText(settings_list[4])
-        self.lne_timeout.setText(settings_list[5])
+        self.lne_timeout.setText(settings_list[5].replace(".", ","))
         self.lne_ip_addr.setText(settings_list[6])
         self.lne_ip_port.setText(settings_list[7])
 
